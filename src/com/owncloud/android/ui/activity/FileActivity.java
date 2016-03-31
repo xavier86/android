@@ -3,7 +3,7 @@
  *
  *   @author David A. Velasco
  *   Copyright (C) 2011  Bartek Przybylski
- *   Copyright (C) 2015 ownCloud Inc.
+ *   Copyright (C) 2016 ownCloud Inc.
  *
  *   This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License version 2,
@@ -43,7 +43,6 @@ import android.support.v4.widget.DrawerLayout;
 import android.support.v7.app.ActionBar;
 import android.support.v7.app.ActionBarDrawerToggle;
 import android.support.v7.app.AppCompatActivity;
-import android.util.Log;
 import android.view.View;
 import android.widget.AdapterView;
 import android.widget.ListView;
@@ -63,15 +62,24 @@ import com.owncloud.android.files.services.FileDownloader;
 import com.owncloud.android.files.services.FileDownloader.FileDownloaderBinder;
 import com.owncloud.android.files.services.FileUploader;
 import com.owncloud.android.files.services.FileUploader.FileUploaderBinder;
+import com.owncloud.android.lib.common.OwnCloudAccount;
+import com.owncloud.android.lib.common.OwnCloudClient;
+import com.owncloud.android.lib.common.OwnCloudClientManagerFactory;
+import com.owncloud.android.lib.common.OwnCloudCredentials;
 import com.owncloud.android.lib.common.operations.OnRemoteOperationListener;
 import com.owncloud.android.lib.common.operations.RemoteOperation;
 import com.owncloud.android.lib.common.operations.RemoteOperationResult;
 import com.owncloud.android.lib.common.operations.RemoteOperationResult.ResultCode;
 import com.owncloud.android.lib.common.utils.Log_OC;
-import com.owncloud.android.operations.CreateShareOperation;
+import com.owncloud.android.lib.resources.status.OCCapability;
+import com.owncloud.android.operations.CreateShareViaLinkOperation;
+import com.owncloud.android.operations.CreateShareWithShareeOperation;
+import com.owncloud.android.operations.GetSharesForFileOperation;
 import com.owncloud.android.operations.SynchronizeFileOperation;
 import com.owncloud.android.operations.SynchronizeFolderOperation;
-import com.owncloud.android.operations.UnshareLinkOperation;
+import com.owncloud.android.operations.UnshareOperation;
+import com.owncloud.android.operations.UpdateSharePermissionsOperation;
+import com.owncloud.android.operations.UpdateShareViaLinkOperation;
 import com.owncloud.android.services.OperationsService;
 import com.owncloud.android.services.OperationsService.OperationsServiceBinder;
 import com.owncloud.android.ui.NavigationDrawerItem;
@@ -92,27 +100,31 @@ public class FileActivity extends AppCompatActivity
 
     public static final String EXTRA_FILE = "com.owncloud.android.ui.activity.FILE";
     public static final String EXTRA_ACCOUNT = "com.owncloud.android.ui.activity.ACCOUNT";
-    public static final String EXTRA_WAITING_TO_PREVIEW =
-            "com.owncloud.android.ui.activity.WAITING_TO_PREVIEW";
     public static final String EXTRA_FROM_NOTIFICATION =
             "com.owncloud.android.ui.activity.FROM_NOTIFICATION";
 
     public static final String TAG = FileActivity.class.getSimpleName();
 
     private static final String DIALOG_WAIT_TAG = "DIALOG_WAIT";
+
     private static final String KEY_WAITING_FOR_OP_ID = "WAITING_FOR_OP_ID";
     private static final String DIALOG_SHARE_PASSWORD = "DIALOG_SHARE_PASSWORD";
-    private static final String KEY_TRY_SHARE_AGAIN = "TRY_SHARE_AGAIN";
     private static final String KEY_ACTION_BAR_TITLE = "ACTION_BAR_TITLE";
 
-    protected static final long DELAY_TO_REQUEST_OPERATION_ON_ACTIVITY_RESULTS = 200;
+    public static final int REQUEST_CODE__UPDATE_CREDENTIALS = 0;
+    public static final int REQUEST_CODE__LAST_SHARED = REQUEST_CODE__UPDATE_CREDENTIALS;
 
+    protected static final long DELAY_TO_REQUEST_OPERATIONS_LATER = 200;
 
     /** OwnCloud {@link Account} where the main {@link OCFile} handled by the activity is located.*/
     private Account mAccount;
 
-    /** Main {@link OCFile} handled by the activity.*/
+    /** Capabilites of the server where {@link #mAccount} lives */
+     private OCCapability mCapabilities;
+
+     /** Main {@link OCFile} handled by the activity.*/
     private OCFile mFile;
+
 
     /** Flag to signal that the activity will is finishing to enforce the creation of an ownCloud
      * {@link Account} */
@@ -139,11 +151,11 @@ public class FileActivity extends AppCompatActivity
 
     private OperationsServiceBinder mOperationsServiceBinder = null;
 
+    private boolean mResumed = false;
+
     protected FileDownloaderBinder mDownloaderBinder = null;
     protected FileUploaderBinder mUploaderBinder = null;
     private ServiceConnection mDownloadServiceConnection, mUploadServiceConnection = null;
-
-    private boolean mTryShareAgain = false;
 
     // Navigation Drawer
     protected DrawerLayout mDrawerLayout;
@@ -157,6 +169,7 @@ public class FileActivity extends AppCompatActivity
     protected ArrayList<NavigationDrawerItem> mDrawerItems;
 
     protected NavigationDrawerListAdapter mNavigationDrawerAdapter = null;
+
 
 
     // TODO re-enable when "Accounts" is available in Navigation Drawer
@@ -181,8 +194,9 @@ public class FileActivity extends AppCompatActivity
             mFileOperationsHelper.setOpIdWaitingFor(
                     savedInstanceState.getLong(KEY_WAITING_FOR_OP_ID, Long.MAX_VALUE)
                     );
-            mTryShareAgain = savedInstanceState.getBoolean(KEY_TRY_SHARE_AGAIN);
-            getSupportActionBar().setTitle(savedInstanceState.getString(KEY_ACTION_BAR_TITLE));
+            if (getSupportActionBar() != null) {
+                getSupportActionBar().setTitle(savedInstanceState.getString(KEY_ACTION_BAR_TITLE));
+            }
         } else {
             account = getIntent().getParcelableExtra(FileActivity.EXTRA_ACCOUNT);
             mFile = getIntent().getParcelableExtra(FileActivity.EXTRA_FILE);
@@ -251,7 +265,7 @@ public class FileActivity extends AppCompatActivity
     @Override
     protected void onResume() {
         super.onResume();
-
+        mResumed = true;
         if (mOperationsServiceBinder != null) {
             doOnResumeAndBound();
         }
@@ -262,10 +276,9 @@ public class FileActivity extends AppCompatActivity
         if (mOperationsServiceBinder != null) {
             mOperationsServiceBinder.removeOperationListener(this);
         }
-
+        mResumed = false;
         super.onPause();
     }
-
 
     @Override
     protected void onDestroy() {
@@ -363,12 +376,7 @@ public class FileActivity extends AppCompatActivity
 //        }
 
         // Display username in drawer
-        Account account = AccountUtils.getCurrentOwnCloudAccount(getApplicationContext());
-        if (account != null) {
-            TextView username = (TextView) navigationDrawerLayout.findViewById(R.id.drawer_username);
-            int lastAtPos = account.name.lastIndexOf("@");
-            username.setText(account.name.substring(0, lastAtPos));
-        }
+        setUsernameInDrawer(navigationDrawerLayout, AccountUtils.getCurrentOwnCloudAccount(getApplicationContext()));
 
         // load slide menu items
         mDrawerTitles = getResources().getStringArray(R.array.drawer_items);
@@ -393,13 +401,18 @@ public class FileActivity extends AppCompatActivity
         //mDrawerItems.add(new NavigationDrawerItem(mDrawerTitles[2],
         //        mDrawerContentDescriptions[2]));
 
+        // Uploads
+        mDrawerItems.add(new NavigationDrawerItem(mDrawerTitles[1], mDrawerContentDescriptions[2],
+                R.drawable.ic_uploads));
+
         // Settings
-        mDrawerItems.add(new NavigationDrawerItem(mDrawerTitles[1], mDrawerContentDescriptions[1],
+        mDrawerItems.add(new NavigationDrawerItem(mDrawerTitles[2], mDrawerContentDescriptions[1],
                 R.drawable.ic_settings));
+
         // Logs
         if (BuildConfig.DEBUG) {
-            mDrawerItems.add(new NavigationDrawerItem(mDrawerTitles[2],
-                    mDrawerContentDescriptions[2],R.drawable.ic_log));
+            mDrawerItems.add(new NavigationDrawerItem(mDrawerTitles[3],
+                    mDrawerContentDescriptions[3], R.drawable.ic_log));
         }
 
         // setting the nav drawer list adapter
@@ -409,6 +422,7 @@ public class FileActivity extends AppCompatActivity
 
 
         mDrawerToggle = new ActionBarDrawerToggle(this, mDrawerLayout,R.string.drawer_open,R.string.drawer_close) {
+
 
             /** Called when a drawer has settled in a completely closed state. */
             public void onDrawerClosed(View view) {
@@ -435,12 +449,27 @@ public class FileActivity extends AppCompatActivity
     }
 
     /**
+     * sets the given account name in the drawer in case the drawer is available. The account name
+     * is shortened beginning from the @-sign in the username.
+     *
+     * @param navigationDrawerLayout the drawer layout to be used
+     * @param account                the account to be set in the drawer
+     */
+    protected void setUsernameInDrawer(View navigationDrawerLayout, Account account) {
+        if (navigationDrawerLayout != null && account != null) {
+            TextView username = (TextView) navigationDrawerLayout.findViewById(R.id.drawer_username);
+            int lastAtPos = account.name.lastIndexOf("@");
+            username.setText(account.name.substring(0, lastAtPos));
+        }
+    }
+
+    /**
      * Updates title bar and home buttons (state and icon).
      *
      * Assumes that navigation drawer is NOT visible.
      */
     protected void updateActionBarTitleAndHomeButton(OCFile chosenFile) {
-        String title = getString(R.string.default_display_name_for_root_folder);    // default
+        String title = getDefaultTitle();    // default
         boolean inRoot;
 
         /// choose the appropiate title
@@ -473,6 +502,9 @@ public class FileActivity extends AppCompatActivity
 
     }
 
+    protected String getDefaultTitle() {
+        return getString(R.string.default_display_name_for_root_folder);
+    }
 
     /**
      *  Sets and validates the ownCloud {@link Account} associated to the Activity.
@@ -550,8 +582,7 @@ public class FileActivity extends AppCompatActivity
         outState.putParcelable(FileActivity.EXTRA_FILE, mFile);
         outState.putBoolean(FileActivity.EXTRA_FROM_NOTIFICATION, mFromNotification);
         outState.putLong(KEY_WAITING_FOR_OP_ID, mFileOperationsHelper.getOpIdWaitingFor());
-        outState.putBoolean(KEY_TRY_SHARE_AGAIN, mTryShareAgain);
-        if(getSupportActionBar().getTitle() != null) {
+        if(getSupportActionBar() != null && getSupportActionBar().getTitle() != null) {
             // Null check in case the actionbar is used in ActionBar.NAVIGATION_MODE_LIST
             // since it doesn't have a title then
             outState.putString(KEY_ACTION_BAR_TITLE, getSupportActionBar().getTitle().toString());
@@ -594,6 +625,18 @@ public class FileActivity extends AppCompatActivity
         mAccount = account;
     }
 
+
+    /**
+     * Getter for the capabilities of the server where the current OC account lives.
+     *
+     * @return  Capabilities of the server where the current OC account lives. Null if the account is not
+     *          set yet.
+     */
+    public OCCapability getCapabilities() {
+        return mCapabilities;
+    }
+
+
     /**
      * @return Value of mFromNotification: True if the Activity is launched by a notification
      */
@@ -606,14 +649,6 @@ public class FileActivity extends AppCompatActivity
      */
     protected boolean isRedirectingToSetupAccount() {
         return mRedirectingToSetupAccount;
-    }
-
-    public boolean isTryShareAgain(){
-        return mTryShareAgain;
-    }
-
-    public void setTryShareAgain(boolean tryShareAgain) {
-       mTryShareAgain = tryShareAgain;
     }
 
     public OperationsServiceBinder getOperationsServiceBinder() {
@@ -672,6 +707,7 @@ public class FileActivity extends AppCompatActivity
     protected void onAccountSet(boolean stateWasRecovered) {
         if (getAccount() != null) {
             mStorageManager = new FileDataStorageManager(getAccount(), getContentResolver());
+            mCapabilities = mStorageManager.getCapability(mAccount.name);
 
         } else {
             Log_OC.wtf(TAG, "onAccountChanged was called with NULL account associated!");
@@ -699,7 +735,7 @@ public class FileActivity extends AppCompatActivity
 
     /**
      *
-     * @param operation     Removal operation performed.
+     * @param operation     Operation performed.
      * @param result        Result of the removal.
      */
     @Override
@@ -709,73 +745,152 @@ public class FileActivity extends AppCompatActivity
 
         mFileOperationsHelper.setOpIdWaitingFor(Long.MAX_VALUE);
 
+        dismissLoadingDialog();
+
         if (!result.isSuccess() && (
                 result.getCode() == ResultCode.UNAUTHORIZED ||
-                result.isIdPRedirection() ||
                 (result.isException() && result.getException() instanceof AuthenticatorException)
                 )) {
 
-            requestCredentialsUpdate();
+            requestCredentialsUpdate(this);
 
             if (result.getCode() == ResultCode.UNAUTHORIZED) {
-                dismissLoadingDialog();
                 Toast t = Toast.makeText(this, ErrorMessageAdapter.getErrorCauseMessage(result,
                                 operation, getResources()),
                         Toast.LENGTH_LONG);
                 t.show();
             }
-            mTryShareAgain = false;
 
-        } else if (operation instanceof CreateShareOperation) {
-            onCreateShareOperationFinish((CreateShareOperation) operation, result);
+        } else if (operation == null ||
+                operation instanceof CreateShareWithShareeOperation ||
+                operation instanceof UnshareOperation ||
+                operation instanceof SynchronizeFolderOperation ||
+                operation instanceof UpdateShareViaLinkOperation ||
+                operation instanceof UpdateSharePermissionsOperation
+                ) {
+            if (result.isSuccess()) {
+                updateFileFromDB();
 
-        } else if (operation instanceof UnshareLinkOperation) {
-            onUnshareLinkOperationFinish((UnshareLinkOperation)operation, result);
+            } else if (result.getCode() != ResultCode.CANCELLED) {
+                Toast t = Toast.makeText(this,
+                        ErrorMessageAdapter.getErrorCauseMessage(result, operation, getResources()),
+                        Toast.LENGTH_LONG);
+                t.show();
+            }
 
-        } else if (operation instanceof SynchronizeFolderOperation) {
-            onSynchronizeFolderOperationFinish((SynchronizeFolderOperation)operation, result);
+        } else if (operation instanceof CreateShareViaLinkOperation) {
+            onCreateShareViaLinkOperationFinish((CreateShareViaLinkOperation) operation, result);
 
-        }else if (operation instanceof SynchronizeFileOperation) {
-            onSynchronizeFileOperationFinish((SynchronizeFileOperation)operation, result);
+        } else if (operation instanceof SynchronizeFileOperation) {
+            onSynchronizeFileOperationFinish((SynchronizeFileOperation) operation, result);
 
+        } else if (operation instanceof GetSharesForFileOperation) {
+            if (result.isSuccess() || result.getCode() == ResultCode.SHARE_NOT_FOUND) {
+                updateFileFromDB();
+
+            } else {
+                Toast t = Toast.makeText(this,
+                        ErrorMessageAdapter.getErrorCauseMessage(result, operation, getResources()),
+                        Toast.LENGTH_LONG);
+                t.show();
+            }
         }
     }
 
-    protected void requestCredentialsUpdate() {
-        Intent updateAccountCredentials = new Intent(this, AuthenticatorActivity.class);
-        updateAccountCredentials.putExtra(AuthenticatorActivity.EXTRA_ACCOUNT, getAccount());
-        updateAccountCredentials.putExtra(
-                AuthenticatorActivity.EXTRA_ACTION,
-                AuthenticatorActivity.ACTION_UPDATE_EXPIRED_TOKEN);
-        updateAccountCredentials.addFlags(Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS);
-        startActivity(updateAccountCredentials);
+    /**
+     * Invalidates the credentials stored for the current OC account and requests new credentials to the user,
+     * navigating to {@link AuthenticatorActivity}
+     *
+     * Equivalent to call requestCredentialsUpdate(context, null);
+     *
+     * @param context   Android Context needed to access the {@link AccountManager}. Received as a parameter
+     *                  to make the method accessible to {@link android.content.BroadcastReceiver}s.
+     */
+    protected void requestCredentialsUpdate(Context context) {
+        requestCredentialsUpdate(context, null);
+    }
+
+    /**
+     * Invalidates the credentials stored for the given OC account and requests new credentials to the user,
+     * navigating to {@link AuthenticatorActivity}
+     *
+     * @param context   Android Context needed to access the {@link AccountManager}. Received as a parameter
+     *                  to make the method accessible to {@link android.content.BroadcastReceiver}s.
+     * @param account   Stored OC account to request credentials update for. If null, current account will
+     *                  be used.
+     */
+    protected void requestCredentialsUpdate(Context context, Account account) {
+
+        try {
+            /// step 1 - invalidate credentials of current account
+            if (account == null) {
+                account = getAccount();
+            }
+            OwnCloudClient client;
+            OwnCloudAccount ocAccount =
+                    new OwnCloudAccount(account, context);
+            client = (OwnCloudClientManagerFactory.getDefaultSingleton().
+                    removeClientFor(ocAccount));
+            if (client != null) {
+                OwnCloudCredentials cred = client.getCredentials();
+                if (cred != null) {
+                    AccountManager am = AccountManager.get(context);
+                    if (cred.authTokenExpires()) {
+                        am.invalidateAuthToken(
+                                account.type,
+                                cred.getAuthToken()
+                        );
+                    } else {
+                        am.clearPassword(account);
+                    }
+                }
+            }
+
+            /// step 2 - request credentials to user
+            Intent updateAccountCredentials = new Intent(this, AuthenticatorActivity.class);
+            updateAccountCredentials.putExtra(AuthenticatorActivity.EXTRA_ACCOUNT, account);
+            updateAccountCredentials.putExtra(
+                    AuthenticatorActivity.EXTRA_ACTION,
+                    AuthenticatorActivity.ACTION_UPDATE_EXPIRED_TOKEN);
+            updateAccountCredentials.addFlags(Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS);
+            startActivityForResult(updateAccountCredentials, REQUEST_CODE__UPDATE_CREDENTIALS);
+
+        } catch (com.owncloud.android.lib.common.accounts.AccountUtils.AccountNotFoundException e) {
+            Toast.makeText(context, R.string.auth_account_does_not_exist, Toast.LENGTH_SHORT).show();
+        }
+
     }
 
 
 
-    private void onCreateShareOperationFinish(CreateShareOperation operation,
-                                              RemoteOperationResult result) {
-        dismissLoadingDialog();
+    private void onCreateShareViaLinkOperationFinish(CreateShareViaLinkOperation operation,
+                                                     RemoteOperationResult result) {
         if (result.isSuccess()) {
-            mTryShareAgain = false;
             updateFileFromDB();
 
-            Intent sendIntent = operation.getSendIntent();
-            startActivity(sendIntent);
+            Intent sendIntent = operation.getSendIntentWithSubject(this);
+            if (sendIntent != null) {
+                startActivity(sendIntent);
+            }
+
         } else {
             // Detect Failure (403) --> needs Password
             if (result.getCode() == ResultCode.SHARE_FORBIDDEN) {
-                if (!isTryShareAgain()) {
+                String password = operation.getPassword();
+                if ((password == null || password.length() == 0) &&
+                    getCapabilities().getFilesSharingPublicEnabled().isUnknown())
+                    {
+                    // Was tried without password, but not sure that it's optional. Try with password.
+                    // Try with password before giving up.
+                    // See also ShareFileFragment#OnShareViaLinkListener
                     SharePasswordDialogFragment dialog =
-                            SharePasswordDialogFragment.newInstance(new OCFile(operation.getPath()),
-                                    operation.getSendIntent());
+                            SharePasswordDialogFragment.newInstance(new OCFile(operation.getPath()), true);
                     dialog.show(getSupportFragmentManager(), DIALOG_SHARE_PASSWORD);
                 } else {
                     Toast t = Toast.makeText(this,
                         ErrorMessageAdapter.getErrorCauseMessage(result, operation, getResources()),
                         Toast.LENGTH_LONG);
                     t.show();
-                    mTryShareAgain = false;
                 }
             } else {
                 Toast t = Toast.makeText(this,
@@ -786,34 +901,8 @@ public class FileActivity extends AppCompatActivity
         }
     }
 
-
-    private void onUnshareLinkOperationFinish(UnshareLinkOperation operation,
-                                              RemoteOperationResult result) {
-        dismissLoadingDialog();
-
-        if (result.isSuccess()){
-            updateFileFromDB();
-
-        } else {
-            Toast t = Toast.makeText(this, ErrorMessageAdapter.getErrorCauseMessage(result,
-                            operation, getResources()), Toast.LENGTH_LONG);
-            t.show();
-        }
-    }
-
-    private void onSynchronizeFolderOperationFinish(
-            SynchronizeFolderOperation operation, RemoteOperationResult result
-    ) {
-        if (!result.isSuccess() && result.getCode() != ResultCode.CANCELLED){
-            Toast t = Toast.makeText(this, ErrorMessageAdapter.getErrorCauseMessage(result,
-                            operation, getResources()), Toast.LENGTH_LONG);
-            t.show();
-        }
-    }
-
     private void onSynchronizeFileOperationFinish(SynchronizeFileOperation operation,
                                                   RemoteOperationResult result) {
-        dismissLoadingDialog();
         OCFile syncedFile = operation.getLocalFile();
         if (!result.isSuccess()) {
             if (result.getCode() == ResultCode.SYNC_CONFLICT) {
@@ -845,9 +934,11 @@ public class FileActivity extends AppCompatActivity
     /**
      * Show loading dialog
      */
-    public void showLoadingDialog() {
+    public void showLoadingDialog(String message) {
+        // grant that only one waiting dialog is shown
+        dismissLoadingDialog();
         // Construct dialog
-        LoadingDialog loading = new LoadingDialog(getResources().getString(R.string.wait_a_moment));
+        LoadingDialog loading = new LoadingDialog(message);
         FragmentManager fm = getSupportFragmentManager();
         FragmentTransaction ft = fm.beginTransaction();
         loading.show(ft, DIALOG_WAIT_TAG);
@@ -893,7 +984,9 @@ public class FileActivity extends AppCompatActivity
                 /*if (!mOperationsServiceBinder.isPerformingBlockingOperation()) {
                     dismissLoadingDialog();
                 }*/
-                doOnResumeAndBound();
+                if (mResumed) {
+                    doOnResumeAndBound();
+                }
 
             } else {
                 return;
@@ -930,11 +1023,6 @@ public class FileActivity extends AppCompatActivity
         startActivity(i);
     }
 
-//    TODO re-enable when "Accounts" is available in Navigation Drawer
-//    public void closeDrawer() {
-//        mDrawerLayout.closeDrawers();
-//    }
-
     public void allFilesOption(){
         restart();
     }
@@ -956,29 +1044,34 @@ public class FileActivity extends AppCompatActivity
 
                 case 0: // All Files
                     allFilesOption();
-                    mDrawerLayout.closeDrawers();
                     break;
 
                 // TODO Enable when "On Device" is recovered ?
 //                case 2:
 //                    MainApp.showOnlyFilesOnDevice(true);
-//                    mDrawerLayout.closeDrawers();
 //                    break;
 
-                case 1: // Settings
+                case 1: // Uploads
+                    Intent uploadListIntent = new Intent(getApplicationContext(),
+                            UploadListActivity.class);
+                    uploadListIntent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                    startActivity(uploadListIntent);
+                    break;
+
+                case 2: // Settings
                     Intent settingsIntent = new Intent(getApplicationContext(),
                             Preferences.class);
                     startActivity(settingsIntent);
-                    mDrawerLayout.closeDrawers();
                     break;
 
-                case 2: // Logs
+                case 3: // Logs
                     Intent loggerIntent = new Intent(getApplicationContext(),
                             LogHistoryActivity.class);
                     startActivity(loggerIntent);
-                    mDrawerLayout.closeDrawers();
                     break;
             }
+            mDrawerLayout.closeDrawers();
         }
     }
+
 }
